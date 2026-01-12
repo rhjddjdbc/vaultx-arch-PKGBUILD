@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Ensure the script is not run as root
+if [ "$EUID" -eq 0 ]; then
+  echo "Please DO NOT run this script as root. Use a user account with sudo privileges."
+  exit 1
+fi
+
+# Check if sudo is available
+if ! command -v sudo >/dev/null; then
+  echo "Error: sudo is not installed. This script requires sudo."
+  exit 1
+fi
+
+echo "=== Arch Linux Hardening Script (Updated: Removed Lockdown & Systemd Hardening) ==="
+echo ""
+
+# Default values
+INSTALL_HARDENED_KERNEL=true
+ENABLE_USBGUARD=true
+ENABLE_FIREWALL=true
+ENABLE_FIREJAIL=true
+ENABLE_AIDE=true
+ENABLE_HBLOCK=true
+ENABLE_DOAS_REPLACE=true
+ENABLE_APPARMOR=true
+ENABLE_RESTRICT_ROOT=true
+ENABLE_IPV6_PRIVACY=true
+ENABLE_IPTABLES_NFT=true
+ENABLE_PTRACE_RESTRICT=true
+INSTALL_FLATPAK=true
+ENABLE_AUDIT=true
+ENABLE_LYNIS=true
+
+# Historically disabled or specific tools
+ENABLE_CLAMAV=false
+ENABLE_HARDENED_MALLOC=false
+ENABLE_TORCTL=false
+ENABLE_MALDET=false
+
+# ==================== INTERACTIVE SELECTION ====================
+
+echo "Please answer the following questions. Press Enter for default [Y]."
+
+read -rp "Install Auditd (Neo23x0 rules)? [Y/n]: " choice
+[[ "$choice" =~ ^[Nn]$ ]] && ENABLE_AUDIT=false
+
+read -rp "Install Lynis (Security Auditor)? [Y/n]: " choice
+[[ "$choice" =~ ^[Nn]$ ]] && ENABLE_LYNIS=false
+
+read -rp "Install linux-hardened kernel? [Y/n]: " choice
+[[ "$choice" =~ ^[Nn]$ ]] && INSTALL_HARDENED_KERNEL=false
+
+read -rp "Enable AppArmor + profiles? [Y/n]: " choice
+[[ "$choice" =~ ^[Nn]$ ]] && ENABLE_APPARMOR=false
+
+read -rp "Enable USBGuard? [Y/n]: " choice
+[[ "$choice" =~ ^[Nn]$ ]] && ENABLE_USBGUARD=false
+
+read -rp "Configure nftables firewall? [Y/n]: " choice
+[[ "$choice" =~ ^[Nn]$ ]] && ENABLE_FIREWALL=false
+
+read -rp "Replace sudo with doas? [Y/n]: " choice
+[[ "$choice" =~ ^[Nn]$ ]] && ENABLE_DOAS_REPLACE=false
+
+echo ""
+echo "Starting hardening steps..."
+sudo pacman -Syyu
+
+# Install yay if needed
+if ! command -v yay &> /dev/null; then
+  echo "Installing yay (AUR helper)..."
+  sudo pacman -S --needed --noconfirm git base-devel
+  git clone https://aur.archlinux.org/yay.git /tmp/yay
+  pushd /tmp/yay >/dev/null && makepkg -si --noconfirm && popd >/dev/null
+  rm -rf /tmp/yay
+fi
+
+# ==================== SYSCTL HARDENING ====================
+apply_sysctl_hardening() {
+  echo "Applying sysctl settings..."
+  sudo tee /etc/sysctl.d/99-sec.conf > /dev/null <<'EOF'
+kernel.kptr_restrict=2
+kernel.dmesg_restrict=1
+kernel.randomize_va_space=2
+fs.suid_dumpable=0
+fs.protected_hardlinks=1
+fs.protected_symlinks=1
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.tcp_syncookies=1
+net.core.bpf_jit_harden=2
+kernel.unprivileged_bpf_disabled=1
+fs.protected_fifos=2
+fs.protected_regular=2
+EOF
+
+  if $ENABLE_PTRACE_RESTRICT; then
+    echo "kernel.yama.ptrace_scope=2" | sudo tee /etc/sysctl.d/99-ptrace.conf > /dev/null
+  fi
+
+  if $ENABLE_IPV6_PRIVACY; then
+    sudo tee /etc/sysctl.d/40-ipv6-privacy.conf > /dev/null <<'EOF'
+net.ipv6.conf.all.use_tempaddr=2
+net.ipv6.conf.default.use_tempaddr=2
+EOF
+  fi
+  sudo sysctl --system
+}
+apply_sysctl_hardening
+
+# ==================== GRUB PARAMETERS ====================
+# Note: 'lockdown' parameter has been removed
+echo "Updating GRUB configuration..."
+base_params="quiet slab_nomerge random.trust_cpu=off page_alloc.shuffle=1 init_on_alloc=1 init_on_free=1 loglevel=3"
+
+apparmor_params=""
+[[ "$ENABLE_APPARMOR" == "true" ]] && apparmor_params="apparmor=1 security=apparmor"
+
+audit_params=""
+[[ "$ENABLE_AUDIT" == "true" ]] && audit_params="audit=1"
+
+full_params="$base_params $apparmor_params $audit_params"
+
+sudo sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"$full_params\"|" /etc/default/grub
+sudo grub-mkconfig -o /boot/grub/grub.cfg
+
+# ==================== KERNEL & REPOS ====================
+if $INSTALL_HARDENED_KERNEL; then
+  echo "Installing linux-hardened..."
+  sudo pacman -S --needed --noconfirm linux-hardened
+fi
+
+if $ENABLE_APPARMOR; then
+  echo "Installing AppArmor..."
+  yay -S --needed --noconfirm apparmor apparmor.d-git
+  sudo systemctl enable --now apparmor
+fi
+
+if $ENABLE_USBGUARD; then
+  echo "Installing USBGuard..."
+  sudo pacman -S --needed --noconfirm usbguard
+  sudo systemctl enable --now usbguard
+fi
+
+# ==================== NFTABLES ====================
+if $ENABLE_FIREWALL; then
+  echo "Configuring nftables..."
+  sudo pacman -S --needed --noconfirm nftables
+  sudo systemctl enable --now nftables
+fi
+
+# ==================== DOAS ====================
+if $ENABLE_DOAS_REPLACE; then
+  echo "Setting up doas..."
+  sudo pacman -S --noconfirm opendoas
+  echo 'permit :wheel' | sudo tee /etc/etc/doas.conf > /dev/null
+  echo "doas installed. Verify with 'doas id' before manually removing sudo if desired."
+fi
+
